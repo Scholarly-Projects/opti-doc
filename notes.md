@@ -1,1 +1,0 @@
-Page segmentation is the next hurdle
