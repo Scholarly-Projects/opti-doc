@@ -7,10 +7,6 @@ from pdf2image import convert_from_path
 import fitz  # PyMuPDF
 from kraken import blla
 from kraken.lib.vgsl import TorchVGSLModel
-from reportlab.pdfgen import canvas
-from reportlab.pdfbase import pdfmetrics
-from reportlab.pdfbase.pdfmetrics import stringWidth 
-from reportlab.pdfbase.ttfonts import TTFont
 from io import BytesIO
 from PIL import Image, ImageEnhance, ImageFilter
 import numpy as np
@@ -25,6 +21,7 @@ import shutil
 import xml.etree.ElementTree as ET
 from xml.dom import minidom
 import math
+import pikepdf
 
 # ---------------- Configuration ----------------
 INPUT_DIR = "A"
@@ -86,8 +83,6 @@ def setup_pdfa_resources():
                 "https://github.com/opensourcedesign/fonts/raw/master/gnu-freefont_freesans/FreeSans.ttf",
                 str(font_path)
             )
-        pdfmetrics.registerFont(TTFont(FONT_NAME, str(font_path)))
-        logger.info(f"Font {FONT_NAME} registered for embedding")
         srgb_path = Path(SRGB_ICC_PATH)
         if not srgb_path.exists():
             logger.info("Downloading sRGB ICC profile...")
@@ -125,26 +120,10 @@ def create_xmp_metadata(title, author, subject, creator, producer, creation_date
          <pdf:Producer>{producer}</pdf:Producer>
       </rdf:Description>
       <rdf:Description rdf:about="" xmlns:dc="http://purl.org/dc/elements/1.1/">
-         <dc:title>
-            <rdf:Alt>
-               <rdf:li xml:lang="x-default">{title}</rdf:li>
-            </rdf:Alt>
-         </dc:title>
-         <dc:creator>
-            <rdf:Seq>
-               <rdf:li>{author}</rdf:li>
-            </rdf:Seq>
-         </dc:creator>
-         <dc:description>
-            <rdf:Alt>
-               <rdf:li xml:lang="x-default">{subject}</rdf:li>
-            </rdf:Alt>
-         </dc:description>
-         <dc:language>
-            <rdf:Bag>
-               <rdf:li>en-US</rdf:li>
-            </rdf:Bag>
-         </dc:language>
+         <dc:title><rdf:Alt><rdf:li xml:lang="x-default">{title}</rdf:li></rdf:Alt></dc:title>
+         <dc:creator><rdf:Seq><rdf:li>{author}</rdf:li></rdf:Seq></dc:creator>
+         <dc:description><rdf:Alt><rdf:li xml:lang="x-default">{subject}</rdf:li></rdf:Alt></dc:description>
+         <dc:language><rdf:Bag><rdf:li>en-US</rdf:li></rdf:Bag></dc:language>
       </rdf:Description>
       <rdf:Description rdf:about="" xmlns:xmp="http://ns.adobe.com/xap/1.0/">
          <xmp:CreatorTool>{creator}</xmp:CreatorTool>
@@ -155,6 +134,11 @@ def create_xmp_metadata(title, author, subject, creator, producer, creation_date
       <rdf:Description rdf:about="" xmlns:pdfaid="http://www.aiim.org/pdfa/ns/id/">
          <pdfaid:part>1</pdfaid:part>
          <pdfaid:conformance>B</pdfaid:conformance>
+      </rdf:Description>
+      <!-- Custom metadata for Opticolumn -->
+      <rdf:Description rdf:about="" xmlns:opt="http://github.com/Scholarly-Projects/opticolumn/">
+         <opt:ToolName>Opticolumn</opt:ToolName>
+         <opt:Version>2026</opt:Version>
       </rdf:Description>
    </rdf:RDF>
 </x:xmpmeta>
@@ -209,21 +193,41 @@ def preprocess_image(pil_image: Image.Image) -> Image.Image:
         logger.error(f"Error preprocessing image: {e}")
         return pil_image
 
-# ---------------- PDF Utilities (Modified for JPEG) ----------------
+# ---------------- PDF Utilities ----------------
 def flatten_pdf_to_images(input_path: str, temp_pdf_path: str) -> bool:
-    """Create a flattened version of the PDF for OCR layer creation — saves as JPEG to reduce size."""
+    """
+    Create a flattened, image-only PDF for OCR processing.
+
+    Each page is rendered via get_pixmap(), which correctly resolves all
+    /Rotate entries and EXIF orientation before returning pixels. The
+    rendered bitmap is saved as lossless PNG instead of the previous JPEG,
+    avoiding quality degradation on already-raster pages.
+
+    IMPORTANT — page dimensions:
+    PyMuPDF's new_page(width, height) takes values in PDF *points*, not
+    pixels.  We pass the original page point dimensions so that the
+    flattened PDF retains standard page geometry.  This means the pixel
+    coordinates returned by the segmentation model must later be scaled
+    to point space before being written back (see process_single_pdf_ocr).
+    """
     try:
         logger.debug(f"Flattening PDF: {input_path}")
         with fitz.open(input_path) as doc, fitz.open() as output_pdf:
             for page_num, page in enumerate(doc):
+                # Render at target DPI — get_pixmap handles /Rotate and EXIF.
                 pix = page.get_pixmap(dpi=DPI)
                 img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
                 img_buffer = BytesIO()
-                # Use more aggressive compression level
-                # In flatten_pdf_to_images:
-                img.save(img_buffer, format="JPEG", quality=COMPRESSION_LEVEL)  # remove optimize/progressive
+                img.save(img_buffer, format="PNG", compress_level=6)  # lossless
                 img_buffer.seek(0)
-                img_page = output_pdf.new_page(width=pix.width, height=pix.height)
+                # Use the ORIGINAL page point dimensions, not pixel dimensions.
+                # This keeps the page the same size as the source document and
+                # means convert_from_path at DPI will produce images at exactly
+                # (page_points * DPI/72) pixels — a known, predictable ratio.
+                img_page = output_pdf.new_page(
+                    width=page.rect.width,
+                    height=page.rect.height,
+                )
                 img_page.insert_image(img_page.rect, stream=img_buffer.read())
             output_pdf.save(temp_pdf_path, deflate=True, garbage=3, clean=True)
         return True
@@ -299,7 +303,6 @@ def improved_column_sort(lines: List) -> List:
     if len(lines) <= 1:
         return lines
     
-    # Extract bounding boxes
     bboxes = []
     for line in lines:
         if hasattr(line, 'boundary') and len(line.boundary) >= 3:
@@ -316,143 +319,101 @@ def improved_column_sort(lines: List) -> List:
     if not bboxes:
         return lines
     
-    # Calculate page dimensions
     page_width = max(box[2] for box in bboxes)
     page_height = max(box[3] for box in bboxes)
     
-    # Step 1: Detect potential columns using horizontal projection
-    resolution = 10  # Resolution for histogram
+    resolution = 10
     hist_width = int(page_width / resolution) + 1
     hist = [0] * hist_width
     
-    # Create horizontal projection histogram
     for x0, y0, x1, y1, _ in bboxes:
         start_bin = int(x0 / resolution)
         end_bin = int(x1 / resolution)
         for bin_idx in range(start_bin, min(end_bin + 1, hist_width)):
-            hist[bin_idx] += (y1 - y0)  # Add line height to the bin
+            hist[bin_idx] += (y1 - y0)
     
-    # Smooth the histogram
     smoothed_hist = hist.copy()
     for i in range(1, len(hist) - 1):
         smoothed_hist[i] = (hist[i-1] + 2*hist[i] + hist[i+1]) / 4
     
-    # Find valleys (potential column separators)
     valleys = []
     for i in range(1, len(smoothed_hist) - 1):
         if smoothed_hist[i] < smoothed_hist[i-1] and smoothed_hist[i] < smoothed_hist[i+1]:
-            # Check if this is a significant valley
             neighborhood_max = max(smoothed_hist[i-1], smoothed_hist[i+1])
             if neighborhood_max > 0 and smoothed_hist[i] / neighborhood_max < 0.3:
                 valleys.append(i * resolution)
     
-    # If no significant valleys found, estimate columns based on line distribution
     if not valleys:
-        # Calculate average line width
         widths = [x1 - x0 for x0, y0, x1, y1, _ in bboxes]
         avg_width = sum(widths) / len(widths) if widths else 100
-        
-        # Estimate number of columns
         estimated_col_count = max(1, int(page_width / (avg_width * 1.5)))
-        estimated_col_count = min(estimated_col_count, 5)  # Limit to 5 columns
-        
-        # Create evenly spaced column separators
+        estimated_col_count = min(estimated_col_count, 5)
         col_width = page_width / estimated_col_count
         valleys = [int((i + 1) * col_width) for i in range(estimated_col_count - 1)]
     
-    # Sort valleys and ensure they're within page bounds
     valleys = sorted([v for v in valleys if 0 < v < page_width])
-    
-    # Step 2: Group lines into columns
     columns = [[] for _ in range(len(valleys) + 1)]
     
     for box in bboxes:
         x0, y0, x1, y1, line = box
         center_x = (x0 + x1) / 2
-        
-        # Determine which column this line belongs to
         col_idx = 0
         for valley in valleys:
             if center_x > valley:
                 col_idx += 1
             else:
                 break
-        
         columns[col_idx].append(box)
     
-    # Step 3: Sort lines within each column by y-coordinate (top to bottom)
-    sorted_columns = []
-    for column in columns:
-        sorted_column = sorted(column, key=lambda box: box[1])  # Sort by y0
-        sorted_columns.append(sorted_column)
-    
-    # Step 4: Flatten columns in left-to-right order
     sorted_lines = []
-    for column in sorted_columns:
-        for bbox in column:
+    for column in columns:
+        for bbox in sorted(column, key=lambda box: box[1]):
             sorted_lines.append(bbox[4])
     
     return sorted_lines
 
-# ---------------- OCR Layer (Pixel-Perfect Alignment) ----------------
-def create_ocr_layer(images: List[Image.Image], filename: str) -> BytesIO:
-    packet = BytesIO()
-    c = canvas.Canvas(packet)
-    try:
-        font_dir = Path("fonts")
-        font_dir.mkdir(exist_ok=True)
-        font_path = Path("fonts/FreeSans.ttf")
-        if not font_path.exists():
-            logger.error(f"CRITICAL: Font file {font_path} not found. Cannot proceed without FreeSans.ttf.")
-            raise FileNotFoundError(f"Required font {font_path} is missing.")
-        pdfmetrics.registerFont(TTFont(FONT_NAME, str(font_path)))
-        logger.info(f"Successfully registered and using embedded font: {FONT_NAME}")
-    except Exception as e:
-        logger.error(f"Failed to load or register FreeSans.ttf: {e}")
-        raise RuntimeError("Font setup failed. FreeSans.ttf is required and must be present in ./fonts/") from e
+# ---------------- OCR Text Element Extraction ----------------
+def create_ocr_text_elements(images: List[Image.Image], filename: str) -> List[List[dict]]:
+    """
+    Run segmentation and TrOCR on each page image.
 
+    Returns a list of pages; each page is a list of dicts with keys:
+        x0, y_baseline, text, font_size
+    All coordinates and font sizes are in IMAGE PIXEL SPACE.
+
+    The caller is responsible for scaling these values into PDF point space
+    using the ratio (pdf_page_points / image_pixels) before calling
+    page.insert_text().  See process_single_pdf_ocr for that scaling step.
+    """
+    font_path = Path(FONT_PATH)
+    if not font_path.exists():
+        logger.error(f"CRITICAL: Font file {font_path} not found.")
+        raise FileNotFoundError(f"Required font {font_path} is missing.")
+
+    all_pages: List[List[dict]] = []
     total_text_elements = 0
+
     for img_idx, pil_image in enumerate(images):
         page_num = img_idx + 1
         logger.info(f"Processing page {page_num}/{len(images)} of {filename}")
         pdf_width, pdf_height = pil_image.size
-        c.setPageSize((pdf_width, pdf_height))
-        c.setFillColorRGB(0, 0, 0, 0)
-        page_text_count = 0
+        page_elements: List[dict] = []
+
         try:
             processed_image = preprocess_image(pil_image)
             segmentation = blla.segment(processed_image, model=seg_model)
             logger.info(f"Found {len(segmentation.lines)} text lines on page {page_num}")
+
             if len(segmentation.lines) == 0:
                 logger.warning("No text lines detected. Saving debug image...")
                 debug_dir = Path("debug_images")
                 debug_dir.mkdir(exist_ok=True)
                 processed_image.save(debug_dir / f"{filename}_page{page_num}_preprocessed.png")
-            filtered_lines = 0
-            
-            # Use improved column sorting
+
             sorted_lines = improved_column_sort(segmentation.lines)
             logger.info(f"Sorted {len(sorted_lines)} lines into column-based reading order.")
-            
-            # Calculate average line height for consistent spacing
-            line_heights = []
-            for line in sorted_lines:
-                if hasattr(line, 'boundary') and len(line.boundary) >= 3:
-                    x_coords = [p[0] for p in line.boundary]
-                    y_coords = [p[1] for p in line.boundary]
-                    x0, y0 = min(x_coords), min(y_coords)
-                    x1, y1 = max(x_coords), max(y_coords)
-                elif hasattr(line, 'bbox'):
-                    x0, y0, x1, y1 = line.bbox
-                else:
-                    continue
-                segment_height = y1 - y0
-                if segment_height >= 5:  # Only consider valid lines
-                    line_heights.append(segment_height)
-            
-            avg_line_height = sum(line_heights) / len(line_heights) if line_heights else 20
-            
-            # Process each line
+            filtered_lines = 0
+
             for i, line in enumerate(sorted_lines):
                 try:
                     if hasattr(line, 'boundary') and len(line.boundary) >= 3:
@@ -464,90 +425,112 @@ def create_ocr_layer(images: List[Image.Image], filename: str) -> BytesIO:
                         x0, y0, x1, y1 = line.bbox
                     else:
                         continue
+
                     segment_height = y1 - y0
-                    segment_width = x1 - x0
+                    segment_width  = x1 - x0
                     if segment_height < 5 or segment_width < 5:
                         filtered_lines += 1
                         continue
+
                     line_image = processed_image.crop((x0, y0, x1, y1))
                     text, confidence = recognize_text_with_trocr(line_image, processor, trocr_model)
+
                     if is_likely_noise(text, confidence, segment_height, segment_width):
                         filtered_lines += 1
                         continue
-                    
-                    # Calculate a font size that fits within the segment's height.
-                    # We use a slightly smaller factor (0.9) to ensure it fits inside the box.
-                    font_size = max(6, min(segment_height * 0.9, 72))
 
-                    # Set the font
-                    c.setFont(FONT_NAME, font_size)
+                    # All values stored in image pixel space.
+                    # font_size is derived from segment_height (pixels); it will
+                    # be multiplied by the same y-scale factor as y_baseline so
+                    # the rendered text height stays proportional to the line box.
+                    page_elements.append({
+                        "x0":         x0,
+                        "y_baseline": y1,          # bottom of bounding box = baseline
+                        "font_size":  max(6, min(segment_height * 0.9, 72)),
+                        "text":       text,
+                    })
 
-                    # Calculate the baseline (vertical position)
-                    # This logic is generally fine for placing the text correctly.
-                    try:
-                        face = pdfmetrics.getFont(FONT_NAME).face
-                        ascent = face.ascent * font_size / 1000.0
-                        descent = face.descent * font_size / 1000.0
-                    except Exception:
-                        # Fallback if font metrics fail
-                        ascent = font_size * 0.8
-                        descent = font_size * 0.2
-                    
-                    y_baseline = pdf_height - y1 + descent
-                    
-                    # Create the text object at the starting x-coordinate of the segment
-                    text_object = c.beginText(x0, y_baseline)
-                    text_object.setFont(FONT_NAME, font_size)
-                    # KEY CHANGE: We do NOT set character spacing. Let the text have natural spacing.
-                    
-                    # Draw the text
-                    text_object.textOut(text)
-                    c.drawText(text_object)
-                    
-                    page_text_count += 1
                 except Exception as e:
                     logger.error(f"Error processing text line {i+1}: {e}")
                     continue
-            logger.info(f"Page {page_num}: Filtered {filtered_lines} noisy lines.")
-            total_text_elements += page_text_count
+
+            logger.info(f"Page {page_num}: {len(page_elements)} elements, {filtered_lines} filtered.")
+            total_text_elements += len(page_elements)
+
         except Exception as e:
             logger.error(f"OCR failed for page {page_num}: {e}")
-        c.showPage()
-    c.save()
-    packet.seek(0)
-    logger.info(f"OCR layer created with {total_text_elements} total text elements")
-    return packet
+
+        all_pages.append(page_elements)
+
+    logger.info(f"OCR extraction complete: {total_text_elements} total text elements across {len(images)} pages")
+    return all_pages
+
+
+# ---------------- PDF/A Compliance Setup ----------------
+def setup_pdfa_compliance(pdf_path: str):
+    try:
+        # Load the ICC profile path
+        srgb_path = Path(SRGB_ICC_PATH)
+        
+        # Use pikepdf to add OutputIntent and embed ICC profile
+        with pikepdf.open(pdf_path) as pdf:
+            if "OutputIntents" not in pdf.Root:
+                pdf.Root["OutputIntents"] = pikepdf.Array()
+            
+            # Create an OutputIntent dictionary
+            output_intent_dict = {
+                "/Type": pikepdf.Name.OutputIntent,
+                "/S": pikepdf.Name.GTS_PDFX,
+                "/Info": "sRGB",
+                "/DestOutputProfile": pdf.make_indirect_reference(pdf.add_file(srgb_path))
+            }
+            
+            # Append the OutputIntent to the Root dictionary
+            pdf.Root["OutputIntents"].append(pikepdf.Dictionary(output_intent_dict))
+            
+            # Save the changes
+            pdf.save(pdf_path)
+        logger.info("PDF/A compliance setup complete.")
+    except Exception as e:
+        logger.error(f"Failed to set up PDF/A compliance: {e}")
 
 # ---------------- PDF Processing (OCR) ----------------
 def process_single_pdf_ocr(input_path: str, output_path: str) -> bool:
     filename = os.path.basename(input_path)
     logger.info(f"Starting OCR for: {filename}")
+
     with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as temp_pdf:
         temp_pdf_path = temp_pdf.name
+
     if not flatten_pdf_to_images(input_path, temp_pdf_path):
         logger.error(f"Failed to flatten {filename}")
         return False
+
     try:
         original_max_pixels = Image.MAX_IMAGE_PIXELS
         Image.MAX_IMAGE_PIXELS = None
 
         pil_images = convert_from_path(temp_pdf_path, dpi=DPI, poppler_path=POPPLER_PATH)
         logger.info(f"Converted to {len(pil_images)} images @ {DPI} DPI")
-        ocr_layer = create_ocr_layer(pil_images, filename)
-        logger.info("Merging OCR layer with base PDF...")
-        with fitz.open(temp_pdf_path) as base_pdf, fitz.open(stream=ocr_layer.getvalue(), filetype="pdf") as ocr_pdf:
+
+        ocr_pages = create_ocr_text_elements(pil_images, filename)
+
+        logger.info("Writing OCR text directly into base PDF pages...")
+        font_path = str(Path(FONT_PATH))
+
+        with fitz.open(temp_pdf_path) as base_pdf:
             creation_date = get_pdf_date_string()
-            modify_date = creation_date
+            modify_date   = creation_date
             metadata = {
-                "title": filename,
-                "author": "OCR Processing",
-                "subject": "OCR processed document",
-                "creator": "OCR Processor",
-                "producer": "PyMuPDF",
+                "title":        filename,
+                "author":       "Opticolumn",
+                "subject":      "OCR processed document",
+                "creator":      "Opticolumn 2026",
+                "producer":     "PyMuPDF",
                 "creationDate": creation_date,
-                "modDate": modify_date
+                "modDate":      modify_date,
             }
-            base_pdf.set_metadata(metadata)
+            
             xmp_metadata = create_xmp_metadata(
                 title=metadata["title"],
                 author=metadata["author"],
@@ -555,36 +538,77 @@ def process_single_pdf_ocr(input_path: str, output_path: str) -> bool:
                 creator=metadata["creator"],
                 producer=metadata["producer"],
                 creation_date=get_xmp_date_string(),
-                modify_date=get_xmp_date_string()
+                modify_date=get_xmp_date_string(),
             )
+            
             if xmp_metadata:
                 base_pdf.set_xml_metadata(xmp_metadata)
             else:
                 logger.warning("Failed to create XMP metadata")
-            page_count = min(len(base_pdf), len(ocr_pdf))
-            logger.info(f"Merging {page_count} pages...")
+
+            page_count = min(len(base_pdf), len(ocr_pages))
+            logger.info(f"Inserting text into {page_count} pages...")
+
             for page_num in range(page_count):
-                base_pdf[page_num].show_pdf_page(base_pdf[page_num].rect, ocr_pdf, page_num)
+                page     = base_pdf[page_num]
+                elements = ocr_pages[page_num]
+                pil_img  = pil_images[page_num]
+
+                # ── Coordinate scaling ────────────────────────────────────────
+                # The segmentation model operated on pil_img (pixel space).
+                # The PDF page uses point space.  flatten_pdf_to_images created
+                # each page with its original point dimensions, so:
+                #
+                #   pixel_coord * (page_points / image_pixels) = point_coord
+                #
+                # We compute one scale factor per axis and apply it to every
+                # coordinate and to the font size.
+                img_w, img_h = pil_img.size          # pixels
+                page_w = page.rect.width              # points
+                page_h = page.rect.height             # points
+                sx = page_w / img_w                   # points per pixel, x-axis
+                sy = page_h / img_h                   # points per pixel, y-axis
+
+                logger.debug(
+                    f"Page {page_num+1}: image {img_w}×{img_h}px → "
+                    f"page {page_w:.1f}×{page_h:.1f}pt  (sx={sx:.4f}, sy={sy:.4f})"
+                )
+
+                inserted = 0
+                for elem in elements:
+                    try:
+                        page.insert_text(
+                            fitz.Point(elem["x0"] * sx, elem["y_baseline"] * sy),
+                            elem["text"],
+                            fontsize=max(4, elem["font_size"] * sy),
+                            fontname=FONT_NAME,
+                            fontfile=font_path,
+                            render_mode=3,   # invisible text (PDF spec §9.3.6)
+                            color=(0, 0, 0),
+                        )
+                        inserted += 1
+                    except Exception as e:
+                        logger.error(f"Failed to insert text element on page {page_num+1}: {e}")
+                        continue
+
+                logger.info(f"Page {page_num+1}: inserted {inserted}/{len(elements)} text elements")
+
             logger.info("Applying PDF/A compliance fixes...")
             srgb_path = Path(SRGB_ICC_PATH)
-            if srgb_path.exists():
-                # Try to add OutputIntent for PDF/A compliance
-                try:
-                    # For older PyMuPDF versions, we'll skip OutputIntent embedding
-                    logger.info("Note: PDF/A OutputIntent embedding requires newer PyMuPDF version")
-                except Exception as e:
-                    logger.warning(f"Could not embed OutputIntent: {e}")
-            else:
+            if not srgb_path.exists():
                 logger.error("CRITICAL: sRGB ICC profile not found. PDF/A-1B compliance is impossible.")
-            # Save with compression settings
+            else:
+                setup_pdfa_compliance(output_path)
+
             base_pdf.save(
                 output_path,
                 deflate=True,
                 garbage=4,
                 clean=True,
-                encryption=fitz.PDF_ENCRYPT_KEEP
+                encryption=fitz.PDF_ENCRYPT_KEEP,
             )
             logger.info(f"OCR-enhanced PDF saved: {output_path}")
+
         logger.info("Verifying OCR layer in final output...")
         try:
             with fitz.open(output_path) as final_pdf:
@@ -601,8 +625,10 @@ def process_single_pdf_ocr(input_path: str, output_path: str) -> bool:
                     logger.error("PROBLEM: Final PDF has no extractable text!")
         except Exception as e:
             logger.error(f"Failed to verify final output: {e}")
+
         Image.MAX_IMAGE_PIXELS = original_max_pixels
         return True
+
     except Exception as e:
         Image.MAX_IMAGE_PIXELS = original_max_pixels
         logger.error(f"OCR processing failed: {e}")
@@ -619,50 +645,37 @@ def enhanced_compress_to_target_size(input_pdf: Path, output_pdf: Path, original
     Enhanced compression function that tries to get the processed file as close as possible 
     to the original file size, allowing up to a 15% increase for the added OCR layer.
     """
-    # Calculate maximum target size (15% increase from original size)
-    max_target = int(original_size * 1.15)  # 15% increase
+    max_target = int(original_size * 1.15)
     
     logger.info(f"Targeting maximum size: {max_target//1024} KB (15% increase from original)")
     
-    # Get the current OCR file size
     current_size = input_pdf.stat().st_size
     logger.info(f"OCR file size before compression: {current_size//1024} KB")
     
-    # If we're already within the target, just copy the file
     if current_size <= max_target:
         shutil.copy2(input_pdf, output_pdf)
         logger.info(f"OCR file already within target size. No compression needed.")
         return output_pdf
     
-    # Try different compression options
     compression_options = [
-        # Option 1: Maximum compression
         {"deflate": True, "garbage": 4, "clean": True, "deflate_images": True, "pretty": False},
-        # Option 2: High compression
         {"deflate": True, "garbage": 3, "clean": True, "deflate_images": True, "pretty": False},
-        # Option 3: Medium compression
         {"deflate": True, "garbage": 2, "clean": True, "deflate_images": False, "pretty": False},
     ]
     
     for i, options in enumerate(compression_options):
         temp_output = output_pdf.with_suffix(f".temp_{i}.pdf")
-        
         try:
             with fitz.open(str(input_pdf)) as doc:
                 doc.save(str(temp_output), **options, encryption=fitz.PDF_ENCRYPT_KEEP)
             
             compressed_size = temp_output.stat().st_size
             size_increase_pct = (compressed_size - original_size) / original_size * 100
-            
             logger.info(f"Compression option {i+1}: {compressed_size//1024} KB ({size_increase_pct:+.1f}% from original)")
             
-            # Check if this is within our target
             if compressed_size <= max_target:
-                # Success! Use this file
                 shutil.move(str(temp_output), str(output_pdf))
                 logger.info(f"Found suitable compression with option {i+1}")
-                
-                # Verify OCR text is preserved
                 try:
                     with fitz.open(str(output_pdf)) as final_pdf:
                         total_chars = sum(len(page.get_text().strip()) for page in final_pdf)
@@ -671,73 +684,40 @@ def enhanced_compress_to_target_size(input_pdf: Path, output_pdf: Path, original
                             return output_pdf
                         else:
                             logger.error("OCR LOST after compression!")
-                            # Fall back to original OCR file
                             shutil.copy2(input_pdf, output_pdf)
                             return output_pdf
                 except Exception as e:
                     logger.warning(f"Could not verify OCR after compression: {e}")
-                    # Fall back to original OCR file
                     shutil.copy2(input_pdf, output_pdf)
                     return output_pdf
             else:
-                # Delete temp file and try next option
                 temp_output.unlink(missing_ok=True)
-                
         except Exception as e:
             logger.error(f"Compression option {i+1} failed: {e}")
-            # Continue to next option
             if temp_output.exists():
                 temp_output.unlink(missing_ok=True)
     
-    # If we're still over the target, we need to try a different approach
     logger.info("Standard compression options insufficient. Trying image recompression...")
     
     try:
         temp_output = output_pdf.with_suffix(".temp_recompress.pdf")
-        
         with fitz.open(str(input_pdf)) as doc:
-            # Extract and recompress images
             for page in doc:
-                # Get all images on the page
-                image_list = page.get_images(full=True)
-                
-                # Process each image
-                for img in image_list:
+                for img in page.get_images(full=True):
                     xref = img[0]
                     base_image = doc.extract_image(xref)
-                    image_data = base_image["image"]
-                    
-                    # Convert to PIL Image
-                    pil_image = Image.open(BytesIO(image_data))
-                    
-                    # Save as JPEG with aggressive compression
+                    pil_image = Image.open(BytesIO(base_image["image"]))
                     img_buffer = BytesIO()
                     pil_image.save(img_buffer, format="JPEG", quality=40, optimize=True, progressive=True)
-                    img_buffer.seek(0)
-                    
-                    # Replace the image in the PDF
                     doc.update_image(xref, img_buffer.getvalue())
-            
-            # Save with maximum compression
-            doc.save(
-                str(temp_output),
-                deflate=True,
-                garbage=4,      # Maximum cleanup
-                clean=True,     # Clean unused objects
-                deflate_images=True,  # Compress images
-                pretty=False,   # Don't pretty print
-                encryption=fitz.PDF_ENCRYPT_KEEP
-            )
+            doc.save(str(temp_output), deflate=True, garbage=4, clean=True,
+                     deflate_images=True, pretty=False, encryption=fitz.PDF_ENCRYPT_KEEP)
         
         compressed_size = temp_output.stat().st_size
         size_increase_pct = (compressed_size - original_size) / original_size * 100
-        
         logger.info(f"Image recompression: {compressed_size//1024} KB ({size_increase_pct:+.1f}% from original)")
-        
-        # If this is still too big, we'll have to use it anyway as it's the best we can do
         shutil.move(str(temp_output), str(output_pdf))
         
-        # Verify OCR text is preserved
         try:
             with fitz.open(str(output_pdf)) as final_pdf:
                 total_chars = sum(len(page.get_text().strip()) for page in final_pdf)
@@ -746,18 +726,14 @@ def enhanced_compress_to_target_size(input_pdf: Path, output_pdf: Path, original
                     return output_pdf
                 else:
                     logger.error("OCR LOST after image recompression!")
-                    # Fall back to original OCR file
                     shutil.copy2(input_pdf, output_pdf)
                     return output_pdf
         except Exception as e:
             logger.warning(f"Could not verify OCR after image recompression: {e}")
-            # Fall back to original OCR file
             shutil.copy2(input_pdf, output_pdf)
             return output_pdf
-            
     except Exception as e:
         logger.error(f"Image recompression failed: {e}")
-        # Fall back to original OCR file
         shutil.copy2(input_pdf, output_pdf)
         return output_pdf
 
@@ -781,13 +757,11 @@ def main():
         logger.info(f"\n{'='*60}")
         logger.info(f"Processing {pdf_path.name} | Original: {original_size//1024} KB")
 
-        # Step 1: OCR
         ocr_temp_path = output_folder / f"{pdf_path.stem}_ocr_temp.pdf"
         if not process_single_pdf_ocr(str(pdf_path), str(ocr_temp_path)):
             logger.error(f"Skipping {pdf_path.name} due to OCR failure.")
             continue
 
-        # Step 2: Enhanced compression targeting original size with max 15% increase
         final_path = output_folder / f"{pdf_path.stem}_final.pdf"
         result_path = enhanced_compress_to_target_size(ocr_temp_path, final_path, original_size)
 
@@ -798,7 +772,6 @@ def main():
         else:
             logger.error(f"Failed to generate final output for {pdf_path.name}")
 
-        # Cleanup temp file
         try:
             ocr_temp_path.unlink()
         except Exception as e:
