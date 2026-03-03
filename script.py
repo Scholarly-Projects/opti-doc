@@ -1,7 +1,22 @@
 #!/usr/bin/env python3
 """
-Opticolumn OCR Script
+Opticolumn OCR Script (Revised)
 
+Key changes from prior iteration:
+  - REMOVED flatten_pdf_to_images / JPEG-PNG round-trip.
+    Pages are now rendered to PIL images IN MEMORY for OCR only; the
+    original PDF content is never re-encoded, so size growth from the
+    OCR layer alone is typically < 5%.
+  - REMOVED aggressive image recompression in enhanced_compress_to_target_size.
+    Since the original images are untouched, standard deflate options are
+    almost always sufficient to stay within the 15% budget.
+  - Preprocessing (grayscale, autocontrast, sharpen) is applied ONLY to
+    the in-memory copy used by the segmentation model and TrOCR.  The copy
+    that ends up in the PDF is the original rendered pixmap, untouched.
+  - Fixed PDF/A compliance call ordering: setup_pdfa_compliance is invoked
+    AFTER base_pdf.save() writes the file to disk.
+  - Coordinate scaling now derived from page.rect vs. pixmap dimensions,
+    exactly as before but without the intermediate temp-PDF indirection.
 """
 
 import sys
