@@ -268,97 +268,205 @@ def is_likely_noise(text: str, confidence: float, seg_h: int, seg_w: int) -> boo
     return False
 
 
-# ---------------- Column Detection and Sorting ----------------
-def geometric_column_sort(lines: List) -> List:
-    """
-    Pure-geometry fallback column sorter using a horizontal projection
-    histogram.  Used only when Kraken has not provided reading-order
-    metadata.  Detects column gaps as valleys in the histogram, assigns
-    each line to a column by its centre-x, then sorts left→right across
-    columns and top→bottom within each column.
-    """
-    if len(lines) <= 1:
-        return lines
+# ============================================================================
+# Reading Order — Surya (all pages)
+# ============================================================================
+#
+# Surya's transformer-based LayoutPredictor and ReadingOrderPredictor are
+# used for every page.  BLLA detects accurate line boundaries and its output
+# is used for all TrOCR crops; Surya is responsible only for determining the
+# correct region-level reading sequence.
+#
+# Surya models are lazy-loaded on the first page processed.
+# ============================================================================
 
-    bboxes = []
-    for line in lines:
-        if hasattr(line, "boundary") and len(line.boundary) >= 3:
-            xs = [p[0] for p in line.boundary]
-            ys = [p[1] for p in line.boundary]
-            x0, y0, x1, y1 = min(xs), min(ys), max(xs), max(ys)
-        elif hasattr(line, "bbox"):
-            x0, y0, x1, y1 = line.bbox
-        else:
+_surya_layout_pred  = None
+_surya_order_pred   = None
+_surya_import_error: str = ""
+
+
+def _get_surya_predictors():
+    """
+    Lazy-load Surya LayoutPredictor + ReadingOrderPredictor.
+
+    Handles three surya release generations:
+      ≥ 0.10 : FoundationPredictor-based (current)
+      0.6–0.9: LayoutPredictor() / ReadingOrderPredictor() with no-arg ctor
+      < 0.6  : OrderPredictor from surya.ordering (fallback)
+    """
+    global _surya_layout_pred, _surya_order_pred, _surya_import_error
+
+    if _surya_import_error:
+        raise ImportError(_surya_import_error)
+    if _surya_layout_pred is not None:
+        return _surya_layout_pred, _surya_order_pred
+
+    try:
+        loaded = False
+
+        # ── Current API (surya ≥ 0.10) ────────────────────────────────────
+        if not loaded:
+            try:
+                from surya.foundation import FoundationPredictor
+                from surya.layout import LayoutPredictor as _LP
+                from surya.reading_order import ReadingOrderPredictor as _OP
+                _fp = FoundationPredictor()
+                _surya_layout_pred = _LP(_fp)
+                _surya_order_pred  = _OP(_fp)
+                loaded = True
+                logger.info("Surya predictors loaded (FoundationPredictor API ≥ 0.10).")
+            except (ImportError, TypeError):
+                pass
+
+        # ── Mid API (surya 0.6–0.9) ───────────────────────────────────────
+        if not loaded:
+            try:
+                from surya.layout import LayoutPredictor as _LP
+                from surya.reading_order import ReadingOrderPredictor as _OP
+                _surya_layout_pred = _LP()
+                _surya_order_pred  = _OP()
+                loaded = True
+                logger.info("Surya predictors loaded (no-arg ctor API 0.6–0.9).")
+            except ImportError:
+                pass
+
+        # ── Legacy API (surya < 0.6) ──────────────────────────────────────
+        if not loaded:
+            from surya.layout import LayoutPredictor as _LP
+            from surya.ordering import OrderPredictor as _OP
+            _surya_layout_pred = _LP()
+            _surya_order_pred  = _OP()
+            logger.info("Surya predictors loaded (legacy ordering API).")
+
+        return _surya_layout_pred, _surya_order_pred
+
+    except Exception as exc:
+        _surya_import_error = str(exc)
+        raise ImportError(f"Could not load Surya predictors: {exc}") from exc
+
+
+# ---------------- Surya Ordering ----------------
+
+def _bbox_intersection_over_line(line_bbox, region_bbox) -> float:
+    """Coverage of line_bbox by region_bbox (intersection / line area)."""
+    ix0 = max(line_bbox[0], region_bbox[0])
+    iy0 = max(line_bbox[1], region_bbox[1])
+    ix1 = min(line_bbox[2], region_bbox[2])
+    iy1 = min(line_bbox[3], region_bbox[3])
+    if ix1 <= ix0 or iy1 <= iy0:
+        return 0.0
+    inter = float((ix1 - ix0) * (iy1 - iy0))
+    line_area = max(1.0, (line_bbox[2] - line_bbox[0]) * (line_bbox[3] - line_bbox[1]))
+    return inter / line_area
+
+
+def _extract_line_bbox(line) -> List[float]:
+    """Return [x0, y0, x1, y1] for a Kraken line object, or None."""
+    if hasattr(line, "boundary") and len(line.boundary) >= 3:
+        xs = [p[0] for p in line.boundary]
+        ys = [p[1] for p in line.boundary]
+        return [min(xs), min(ys), max(xs), max(ys)]
+    if hasattr(line, "bbox"):
+        return list(line.bbox)
+    return None
+
+
+def _order_with_surya(pil_image: Image.Image, blla_lines: List) -> List:
+    """
+    Use Surya to determine reading order for a page.
+
+    Steps:
+      1. Surya LayoutPredictor detects page regions (Text, Title, Figure…).
+      2. Surya ReadingOrderPredictor sequences those regions.
+      3. Each BLLA line is assigned to the region it overlaps most
+         (coverage threshold: > 10% of line area).
+      4. Lines are sorted top→bottom within each region, then concatenated
+         in region reading order.  Unassigned lines are appended last.
+
+    BLLA line geometries are used for all TrOCR crops; Surya only provides
+    the region-level ordering sequence.
+    """
+    layout_pred, order_pred = _get_surya_predictors()
+
+    img_rgb        = pil_image.convert("RGB")
+    layout_results = layout_pred([img_rgb])
+
+    # Reading order — handle API variations
+    try:
+        order_results   = order_pred([img_rgb], layout_results)
+        ordered_regions = order_results[0].ordered_bboxes
+    except TypeError:
+        # Legacy API: OrderPredictor takes only images and returns .bboxes + .position
+        order_results   = order_pred([img_rgb])
+        ordered_regions = sorted(order_results[0].bboxes, key=lambda b: b.position)
+
+    if not ordered_regions:
+        logger.warning("Surya returned no layout regions; using top→bottom fallback.")
+        def _y0(line):
+            lb = _extract_line_bbox(line)
+            return lb[1] if lb else 0
+        return sorted(blla_lines, key=_y0)
+
+    # Surya bbox format is [x0, y0, x1, y1] (ints or floats)
+    region_bboxes = [[rb.bbox[0], rb.bbox[1], rb.bbox[2], rb.bbox[3]]
+                     for rb in ordered_regions]
+
+    # Assign BLLA lines to regions
+    buckets: List[List[Tuple[float, object]]] = [[] for _ in range(len(region_bboxes))]
+    unassigned: List = []
+
+    for bline in blla_lines:
+        lb = _extract_line_bbox(bline)
+        if lb is None:
+            unassigned.append(bline)
             continue
-        bboxes.append((x0, y0, x1, y1, line))
 
-    if not bboxes:
-        return lines
+        best_idx = -1
+        best_cov = 0.0
+        for ri, rb in enumerate(region_bboxes):
+            cov = _bbox_intersection_over_line(lb, rb)
+            if cov > best_cov:
+                best_cov, best_idx = cov, ri
 
-    page_width = max(b[2] for b in bboxes)
-    resolution = 10
-    hist_w = int(page_width / resolution) + 1
-    hist   = [0] * hist_w
-    for x0, y0, x1, y1, _ in bboxes:
-        for bi in range(int(x0 / resolution), min(int(x1 / resolution) + 1, hist_w)):
-            hist[bi] += (y1 - y0)
+        if best_idx >= 0 and best_cov > 0.10:
+            buckets[best_idx].append((lb[1], bline))   # sort key = y0
+        else:
+            unassigned.append(bline)
 
-    smoothed = hist.copy()
-    for i in range(1, len(hist) - 1):
-        smoothed[i] = (hist[i - 1] + 2 * hist[i] + hist[i + 1]) / 4
+    # Collect: regions in Surya order, lines within each region top→bottom
+    result: List = []
+    for bucket in buckets:
+        for _, bline in sorted(bucket):
+            result.append(bline)
+    result.extend(unassigned)
 
-    valleys = []
-    for i in range(1, len(smoothed) - 1):
-        if smoothed[i] < smoothed[i - 1] and smoothed[i] < smoothed[i + 1]:
-            nbr_max = max(smoothed[i - 1], smoothed[i + 1])
-            if nbr_max > 0 and smoothed[i] / nbr_max < 0.3:
-                valleys.append(i * resolution)
-
-    if not valleys:
-        widths = [x1 - x0 for x0, y0, x1, y1, _ in bboxes]
-        avg_w  = sum(widths) / len(widths) if widths else 100
-        n_cols = max(1, min(int(page_width / (avg_w * 1.5)), 5))
-        col_w  = page_width / n_cols
-        valleys = [int((i + 1) * col_w) for i in range(n_cols - 1)]
-
-    valleys  = sorted(v for v in valleys if 0 < v < page_width)
-    columns  = [[] for _ in range(len(valleys) + 1)]
-    for box in bboxes:
-        x0, y0, x1, y1, line = box
-        cx    = (x0 + x1) / 2
-        col_i = sum(1 for v in valleys if cx > v)
-        columns[col_i].append(box)
-
-    sorted_lines = []
-    for col in columns:
-        for box in sorted(col, key=lambda b: b[1]):
-            sorted_lines.append(box[4])
-    return sorted_lines
+    logger.info(
+        f"Surya: {len(ordered_regions)} regions → "
+        f"{len(result) - len(unassigned)} lines assigned, "
+        f"{len(unassigned)} unassigned (appended at end)."
+    )
+    return result
 
 
-def order_lines(segmentation) -> List:
+def order_lines(segmentation, pil_image: Image.Image) -> List:
     """
-    Return segmentation lines in the best available reading order.
+    Return BLLA segmentation lines in correct reading order using Surya.
 
-    Strategy:
-      1. Kraken blla already runs its own reading-order algorithm before
-         returning (the "Compute reading order / topological sort" log lines
-         come from inside blla).  `segmentation.lines` is therefore already
-         in reading order — use it directly whenever it has content.
-      2. Only fall back to geometric_column_sort when the segmentation
-         result is empty or carries no lines at all.
-
-    This prevents our histogram sort from undoing the ordering Kraken spent
-    time computing, which was the root cause of column mis-ordering on
-    multi-column newspaper pages.
+    Surya's LayoutPredictor and ReadingOrderPredictor are applied to every
+    page.  BLLA line geometries remain the source of truth for TrOCR crops;
+    Surya only provides the region-level reading sequence that those lines
+    are sorted into.  If Surya fails for any reason, lines fall back to
+    BLLA native order with a logged error.
     """
     lines = getattr(segmentation, "lines", [])
     if not lines:
         return []
 
-    # Kraken has provided an ordered list — trust it.
-    logger.debug(f"Using Kraken reading order for {len(lines)} lines.")
-    return list(lines)
+    try:
+        return _order_with_surya(pil_image, lines)
+    except Exception as exc:
+        logger.error(f"Surya ordering failed ({exc}); falling back to BLLA order.")
+        return list(lines)
 
 
 # ---------------- OCR Text Element Extraction ----------------
@@ -397,8 +505,8 @@ def create_ocr_text_elements(
                 debug_dir.mkdir(exist_ok=True)
                 ocr_image.save(debug_dir / f"{filename}_page{page_num}_preprocessed.png")
 
-            sorted_lines = order_lines(segmentation)
-            logger.info(f"Sorted {len(sorted_lines)} lines into reading order.")
+            sorted_lines = order_lines(segmentation, pil_image)
+            logger.info(f"Page {page_num}: {len(sorted_lines)} lines ordered.")
 
             for i, line in enumerate(sorted_lines):
                 try:
