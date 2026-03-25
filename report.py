@@ -40,7 +40,7 @@ from transformers import TrOCRProcessor, VisionEncoderDecoderModel
 
 # ── Configuration (mirrors main script) ───────────────────────────────────────
 INPUT_DIR  = "A"       # Original PDFs
-OUTPUT_DIR = "B"       # OCR-processed PDFs  (naming: {stem}_final.pdf)
+OUTPUT_DIR = "B"     
 REPORT_DIR = "D"       # CSV output destination
 MODELS_DIR = "mlmodels"
 
@@ -315,7 +315,7 @@ def main() -> None:
 
     for a_pdf in a_pdfs:
         stem  = a_pdf.stem
-        b_pdf = b_folder / f"{stem}_final.pdf"
+        b_pdf = b_folder / f"{stem}.pdf"
 
         if not b_pdf.exists():
             logger.warning(
@@ -382,7 +382,7 @@ def main() -> None:
     if not rows:
         logger.error(
             "No matching file pairs found between A/ and B/. "
-            "Ensure B/ contains files named {stem}_final.pdf."
+            "Ensure B/ contains files named {stem}.pdf."
         )
         sys.exit(1)
 

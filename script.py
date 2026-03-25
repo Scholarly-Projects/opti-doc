@@ -737,7 +737,7 @@ def main():
             logger.error(f"Skipping {pdf_path.name} due to OCR failure.")
             continue
 
-        final_path  = output_folder / f"{pdf_path.stem}_final.pdf"
+        final_path  = output_folder / f"{pdf_path.stem}.pdf"
         result_path = compress_to_target_size(ocr_temp_path, final_path, original_size)
 
         if result_path.exists():
