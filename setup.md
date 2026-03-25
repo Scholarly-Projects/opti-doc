@@ -46,3 +46,5 @@ or avoid display sleep
 caffeinate -di python script.py
 and
 python review.py
+or 
+python report.py
