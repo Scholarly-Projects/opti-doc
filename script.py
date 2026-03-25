@@ -113,7 +113,7 @@ def setup_pdfa_resources():
 
 
 # ---------------- XMP Metadata ----------------
-def create_xmp_metadata(title, author, subject, creator, producer, creation_date, modify_date):
+def create_xmp_metadata(title, author, subject, creator, producer, creation_date, modify_date, language="en-US"):
     try:
         return f"""<?xpacket begin="\xef\xbb\xbf" id="W5M0MpCehiHzreSzNTczkc9d"?>
 <x:xmpmeta xmlns:x="adobe:ns:meta/">
@@ -125,6 +125,7 @@ def create_xmp_metadata(title, author, subject, creator, producer, creation_date
       <dc:title><rdf:Alt><rdf:li xml:lang="x-default">{title}</rdf:li></rdf:Alt></dc:title>
       <dc:creator><rdf:Seq><rdf:li>{author}</rdf:li></rdf:Seq></dc:creator>
       <dc:description><rdf:Alt><rdf:li xml:lang="x-default">{subject}</rdf:li></rdf:Alt></dc:description>
+      <dc:language><rdf:Bag><rdf:li>{language}</rdf:li></rdf:Bag></dc:language>
     </rdf:Description>
     <rdf:Description rdf:about="" xmlns:xmp="http://ns.adobe.com/xap/1.0/">
       <xmp:CreatorTool>{creator}</xmp:CreatorTool>
@@ -499,7 +500,7 @@ def process_single_pdf_ocr(input_path: str, output_path: str) -> bool:
             # ── Run OCR on rendered images ───────────────────────────────────
             ocr_pages = create_ocr_text_elements(pil_images, filename)
 
-            # ── Set document metadata ────────────────────────────────────────
+# ── Set document metadata ────────────────────────────────────────
             now           = datetime.datetime.now()
             creation_date = get_pdf_date_string(now)
             doc.set_metadata({
@@ -519,9 +520,13 @@ def process_single_pdf_ocr(input_path: str, output_path: str) -> bool:
                 producer="PyMuPDF",
                 creation_date=get_xmp_date_string(now),
                 modify_date=get_xmp_date_string(now),
+                language="en-US",
             )
             if xmp:
                 doc.set_xml_metadata(xmp)
+            cat = doc.pdf_catalog()
+            doc.xref_set_key(cat, "ViewerPreferences", "<</DisplayDocTitle true>>")
+            doc.xref_set_key(cat, "Lang", "(en-US)")
 
             # ── Insert invisible text into original pages ────────────────────
             page_count = min(len(doc), len(ocr_pages))

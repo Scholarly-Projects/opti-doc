@@ -40,4 +40,9 @@ pip install --upgrade torch==2.6.0 torchvision==0.21.0 torchaudio==2.6.0 --index
 
 # Run your scripts
 python script.py
+or avoid idle sleep
+caffeinate -i python script.py
+or avoid display sleep
+caffeinate -di python script.py
+and
 python review.py
