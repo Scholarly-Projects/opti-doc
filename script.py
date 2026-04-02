@@ -35,11 +35,13 @@ TROCR_MODELS = {
     "large_handwritten": "microsoft/trocr-large-handwritten",
     "large_printed":     "microsoft/trocr-large-printed",
 }
-TROCR_MODEL_NAME               = TROCR_MODELS["large_handwritten"]
-ENABLE_PREPROCESSING           = True   # affects OCR copy only, not stored images
-CONFIDENCE_THRESHOLD           = 0.25
+TROCR_MODEL_NAME                 = TROCR_MODELS["large_handwritten"]
+ENABLE_PREPROCESSING             = True   # affects OCR copy only, not stored images
+CONFIDENCE_THRESHOLD             = 0.25
 SINGLE_CHAR_CONFIDENCE_THRESHOLD = 0.5
-MIN_SEGMENT_HEIGHT             = 10
+MIN_SEGMENT_HEIGHT               = 10
+BORN_DIGITAL_CHARS_PER_PAGE      = 100   # avg chars/page threshold for born-digital detection
+BORN_DIGITAL_KB_PER_PAGE         = 50    # KB/page below which a doc is virtually certain to be born-digital
 # For invisible OCR text (render_mode=3) we use a PDF base-14 font so that
 # nothing is embedded in the output file — eliminating ~400 KB per document.
 FONT_NAME  = "helv"                  # Helvetica — built-in, zero embedding overhead
@@ -470,6 +472,69 @@ def setup_pdfa_compliance(pdf_path: str):
         logger.error(f"Failed to set up PDF/A compliance: {e}")
 
 
+# ---------------- Born-Digital Detection ----------------
+def classify_pdf(input_path: str) -> str:
+    """
+    Return 'born_digital' if the PDF already has substantial native text,
+    or 'scanned' if it is an image-based document that needs OCR.
+
+    Two-stage check:
+      1. Fast size heuristic — scanned image PDFs are almost never smaller
+         than BORN_DIGITAL_KB_PER_PAGE KB/page even after aggressive JPEG
+         compression.  Anything below this threshold is virtually certain
+         to be born-digital and is classified immediately without reading
+         page content.
+      2. Character-count sample — sample up to 10 evenly-spaced pages and
+         average the extractable character count.  A threshold of
+         BORN_DIGITAL_CHARS_PER_PAGE chars/page reliably separates true
+         scans (0–5 chars, usually stray artifacts) from born-digital docs
+         (hundreds to thousands of chars per page).
+
+    The safe fallback on any error is 'scanned' — better to attempt OCR
+    on a born-digital file than to silently skip a genuine scan.
+    """
+    try:
+        path = Path(input_path)
+        with fitz.open(input_path) as doc:
+            n = len(doc)
+            if n == 0:
+                return "scanned"
+
+            # ── Stage 1: fast size heuristic ─────────────────────────────
+            bytes_per_page = path.stat().st_size / n
+            kb_per_page    = bytes_per_page / 1024
+            if kb_per_page < BORN_DIGITAL_KB_PER_PAGE:
+                logger.info(
+                    f"Born-digital check (size): {kb_per_page:.1f} KB/page "
+                    f"— below {BORN_DIGITAL_KB_PER_PAGE} KB/page threshold, "
+                    f"classifying as born_digital."
+                )
+                return "born_digital"
+
+            # ── Stage 2: character-count sample ──────────────────────────
+            indices = sorted(set(
+                [0] +
+                [int(n * i / 9) for i in range(1, 9)] +
+                [n - 1]
+            ))[:10]
+            char_counts = []
+            for i in indices:
+                text = doc[i].get_text().strip()
+                char_counts.append(len(text))
+            avg = sum(char_counts) / len(char_counts)
+            logger.info(
+                f"Born-digital check (text): avg {avg:.0f} chars/page over "
+                f"{len(indices)} sampled pages."
+            )
+            if avg >= BORN_DIGITAL_CHARS_PER_PAGE:
+                return "born_digital"
+            return "scanned"
+
+    except Exception as e:
+        logger.error(f"classify_pdf failed for {input_path}: {e}")
+        return "scanned"  # safe fallback — process it, don't skip it
+
+
 # ---------------- PDF Processing (OCR) ----------------
 def process_single_pdf_ocr(input_path: str, output_path: str) -> bool:
     """
@@ -500,7 +565,7 @@ def process_single_pdf_ocr(input_path: str, output_path: str) -> bool:
             # ── Run OCR on rendered images ───────────────────────────────────
             ocr_pages = create_ocr_text_elements(pil_images, filename)
 
-# ── Set document metadata ────────────────────────────────────────
+            # ── Set document metadata ────────────────────────────────────────
             now           = datetime.datetime.now()
             creation_date = get_pdf_date_string(now)
             doc.set_metadata({
@@ -619,6 +684,35 @@ def process_single_pdf_ocr(input_path: str, output_path: str) -> bool:
         except Exception as e:
             logger.error(f"Failed to verify final output: {e}")
 
+        # ── Zero-OCR sentinel ────────────────────────────────────────────────
+        # If the file is large enough to be a genuine scan (images intact)
+        # but the OCR layer is empty, segmentation or TrOCR produced nothing
+        # usable above threshold.  Flag it for manual review rather than
+        # silently accepting a hollow output.
+        try:
+            with fitz.open(output_path) as final_pdf:
+                total_chars  = sum(len(pg.get_text().strip()) for pg in final_pdf)
+                file_size    = Path(output_path).stat().st_size
+                pages        = len(final_pdf)
+                kb_per_page  = (file_size / pages) / 1024
+
+            if total_chars == 0 and kb_per_page > BORN_DIGITAL_KB_PER_PAGE:
+                logger.error(
+                    f"ZERO-OCR WARNING: {filename} appears to be a genuine scan "
+                    f"({kb_per_page:.0f} KB/page) but no searchable text was inserted. "
+                    f"Segmentation or TrOCR produced no output above threshold. "
+                    f"Manual review required."
+                )
+                flag_path = Path(output_path).with_suffix(".NEEDS_REVIEW")
+                flag_path.write_text(
+                    f"Zero OCR text detected in genuine scan.\n"
+                    f"File: {filename}\n"
+                    f"Pages: {pages}\n"
+                    f"Size: {file_size // 1024} KB ({kb_per_page:.0f} KB/page)\n"
+                )
+        except Exception as e:
+            logger.error(f"Zero-OCR sentinel check failed: {e}")
+
         return True
 
     except Exception as e:
@@ -694,10 +788,6 @@ def compress_to_target_size(input_pdf: Path, output_pdf: Path, original_size: in
             logger.error(f"Compression option {i+1} failed: {e}")
             temp_out.unlink(missing_ok=True)
 
-    # If still over budget, log a warning and return the uncompressed OCR file.
-    # Aggressive JPEG recompression is intentionally NOT attempted here —
-    # it destroys archival quality and causes generation loss on already-
-    # compressed sources.
     logger.warning(
         "All deflate options exceeded the 15% size budget. "
         "Returning OCR file as-is (images untouched, quality preserved). "
@@ -723,13 +813,50 @@ def main():
         logger.error(f"No PDF files in '{INPUT_DIR}'")
         sys.exit(1)
 
-    logger.info(f"Processing {len(pdf_files)} files with TrOCR: {TROCR_MODEL_NAME}")
+    # ── Resume detection ────────────────────────────────────────────────────
+    # Match on stem only — a born-digital copy and an OCR-processed file will
+    # both have the same stem, so either counts as done.
+    already_done = {p.stem for p in output_folder.glob("*.pdf")}
+    pending      = [p for p in pdf_files if p.stem not in already_done]
+    skipped      = len(pdf_files) - len(pending)
+
+    if skipped:
+        logger.info(
+            f"Resuming batch: {skipped} file(s) already in '{OUTPUT_DIR}/' will be skipped."
+        )
+
+    if not pending:
+        logger.info("All files have already been processed. Nothing to do.")
+        sys.exit(0)
+
+    logger.info(f"Processing {len(pending)} of {len(pdf_files)} file(s) with TrOCR: {TROCR_MODEL_NAME}")
     logger.info("Target: Final size ≤ original + 15% (OCR text layer only; images untouched)")
 
-    for pdf_path in pdf_files:
+    for pdf_path in pending:
         original_size = pdf_path.stat().st_size
         logger.info(f"\n{'=' * 60}")
         logger.info(f"Processing {pdf_path.name} | Original: {original_size // 1024} KB")
+
+        # ── Born-digital gate ────────────────────────────────────────────────
+        # Born-digital PDFs already contain native searchable text.  Running
+        # them through the OCR pipeline is harmful: the redaction step strips
+        # vector content (paths, Form XObjects, decorative elements) while
+        # blla + TrOCR produce little or no usable output on clean typeset
+        # renders.  The safe action is to copy the file as-is.
+        #
+        # classify_pdf() uses two sequential checks:
+        #   1. KB/page size heuristic (fast, no page reads)
+        #   2. Sampled character-count (catches denser born-digital docs)
+        doc_type = classify_pdf(str(pdf_path))
+        if doc_type == "born_digital":
+            final_path = output_folder / f"{pdf_path.stem}.pdf"
+            shutil.copy2(pdf_path, final_path)
+            logger.info(
+                f"SKIPPED OCR (born-digital): {pdf_path.name} copied as-is — "
+                f"document already contains native searchable text."
+            )
+            continue
+        # ── Scanned document — proceed with full OCR pipeline ────────────────
 
         ocr_temp_path = output_folder / f"{pdf_path.stem}_ocr_temp.pdf"
 
@@ -741,7 +868,7 @@ def main():
         result_path = compress_to_target_size(ocr_temp_path, final_path, original_size)
 
         if result_path.exists():
-            final_size   = result_path.stat().st_size
+            final_size    = result_path.stat().st_size
             size_increase = (final_size - original_size) / original_size * 100
             logger.info(
                 f"SUCCESS: {result_path.name} | {final_size // 1024} KB "
