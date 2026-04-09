@@ -723,10 +723,27 @@ def main():
         logger.error(f"No PDF files in '{INPUT_DIR}'")
         sys.exit(1)
 
-    logger.info(f"Processing {len(pdf_files)} files with TrOCR: {TROCR_MODEL_NAME}")
+    # Identify already-processed files and skip them
+    skipped = []
+    pending = []
+    for pdf_path in pdf_files:
+        final_path = output_folder / f"{pdf_path.stem}.pdf"
+        if final_path.exists():
+            skipped.append(pdf_path.name)
+        else:
+            pending.append(pdf_path)
+
+    if skipped:
+        logger.info(f"Skipping {len(skipped)} already-processed file(s): {', '.join(skipped)}")
+
+    if not pending:
+        logger.info("All files have already been processed. Nothing to do.")
+        return
+
+    logger.info(f"Processing {len(pending)} file(s) with TrOCR: {TROCR_MODEL_NAME}")
     logger.info("Target: Final size ≤ original + 15% (OCR text layer only; images untouched)")
 
-    for pdf_path in pdf_files:
+    for pdf_path in pending:
         original_size = pdf_path.stat().st_size
         logger.info(f"\n{'=' * 60}")
         logger.info(f"Processing {pdf_path.name} | Original: {original_size // 1024} KB")
@@ -741,7 +758,7 @@ def main():
         result_path = compress_to_target_size(ocr_temp_path, final_path, original_size)
 
         if result_path.exists():
-            final_size   = result_path.stat().st_size
+            final_size    = result_path.stat().st_size
             size_increase = (final_size - original_size) / original_size * 100
             logger.info(
                 f"SUCCESS: {result_path.name} | {final_size // 1024} KB "
