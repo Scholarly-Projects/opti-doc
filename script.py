@@ -415,7 +415,7 @@ def create_ocr_text_elements(
                         "x0":         x0,
                         "y_baseline": y1,
                         "font_size":  max(6, min(sh * 0.9, 72)),
-                        "text":       text,
+                        "text":       text + " ",
                     })
 
                 except Exception as e:

@@ -20,3 +20,4 @@
 ### uiext
 
 - A little back and forth while fine tuning the script.
+- Remove 612x792 and 792x612 before processing
