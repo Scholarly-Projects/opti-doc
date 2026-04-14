@@ -356,15 +356,6 @@ def create_ocr_text_elements(
     copy).  Returns per-page lists of dicts with pixel-space coordinates.
 
     Keys: x0, y_baseline, font_size, text
-
-    Words are inserted individually rather than as full line strings.
-    PDF text extraction algorithms determine word boundaries using the
-    physical coordinate gap between spans, not string content — inserting
-    one span per line causes all adjacent lines to concatenate without
-    spaces regardless of trailing/leading whitespace on the strings.
-    Splitting to word-level spans creates genuine coordinate gaps that
-    all extractors (copy-paste, get_text(), search indexers) recognise
-    as word boundaries universally.
     """
     font_path = Path(FONT_PATH)
     if not font_path.exists():
@@ -420,38 +411,17 @@ def create_ocr_text_elements(
                         filtered += 1
                         continue
 
-                    # ── Word-level insertion ──────────────────────────────────
-                    # Split the recognised line into individual words and assign
-                    # each word a proportional x-position within the line bbox.
-                    # This creates genuine coordinate gaps between words in the
-                    # PDF content stream, which is what all extraction algorithms
-                    # use to determine word boundaries.  A single line-level span
-                    # produces no inter-word gaps at line junctions regardless of
-                    # trailing whitespace, causing cross-line concatenation.
-                    words = text.split()
-                    if words:
-                        line_width = x1 - x0
-                        # Estimate average character width from the full line.
-                        char_width = line_width / max(len(text), 1)
-                        cursor = x0
-                        font_size = max(6, min(sh * 0.9, 72))
-                        for word in words:
-                            page_elements.append({
-                                "x0":         cursor,
-                                "y_baseline": y1,
-                                "font_size":  font_size,
-                                "text":       word,
-                            })
-                            # Advance cursor by this word's width plus one space.
-                            cursor += (len(word) + 1) * char_width
+                    page_elements.append({
+                        "x0":         x0,
+                        "y_baseline": y1,
+                        "font_size":  max(6, min(sh * 0.9, 72)),
+                        "text":       text,
+                    })
 
                 except Exception as e:
                     logger.error(f"Error on text line {i + 1}: {e}")
 
-            logger.info(
-                f"Page {page_num}: {len(page_elements)} word elements inserted, "
-                f"{filtered} lines filtered."
-            )
+            logger.info(f"Page {page_num}: {len(page_elements)} elements, {filtered} filtered.")
             total_elements += len(page_elements)
 
         except Exception as e:
@@ -460,7 +430,7 @@ def create_ocr_text_elements(
         all_pages.append(page_elements)
 
     logger.info(
-        f"OCR extraction complete: {total_elements} total word elements "
+        f"OCR extraction complete: {total_elements} total text elements "
         f"across {len(pil_images)} pages"
     )
     return all_pages
@@ -530,7 +500,7 @@ def process_single_pdf_ocr(input_path: str, output_path: str) -> bool:
             # ── Run OCR on rendered images ───────────────────────────────────
             ocr_pages = create_ocr_text_elements(pil_images, filename)
 
-            # ── Set document metadata ────────────────────────────────────────
+# ── Set document metadata ────────────────────────────────────────
             now           = datetime.datetime.now()
             creation_date = get_pdf_date_string(now)
             doc.set_metadata({
@@ -612,7 +582,7 @@ def process_single_pdf_ocr(input_path: str, output_path: str) -> bool:
                     except Exception as e:
                         logger.error(f"Failed to insert text on page {page_num+1}: {e}")
 
-                logger.info(f"Page {page_num+1}: inserted {inserted}/{len(elements)} word elements")
+                logger.info(f"Page {page_num+1}: inserted {inserted}/{len(elements)} text elements")
 
             # ── Save with deflate; do NOT re-encode images ───────────────────
             doc.save(
