@@ -48,3 +48,11 @@ and
 python review.py
 or 
 python report.py
+
+# For CDIL Reference:
+
+If the script is "killed" by a PDF file, find the file name in the terminal below and move that file from the "A" folder to the "Review" folder before running:
+
+caffeinate -di python script.py
+
+To continue processing the collection. Otherwise, the **problem file** will be processed and kill the script again. These files in the review folder will be analyzed to troubleshoot the script in future iterations -- but they seem to be around 1 in 300 at the moment.
