@@ -355,7 +355,10 @@ def create_ocr_text_elements(
     Run segmentation + TrOCR on each PIL image (which may be a preprocessed
     copy).  Returns per-page lists of dicts with pixel-space coordinates.
 
-    Keys: x0, y_baseline, font_size, text
+    Keys: x0, x1, y_baseline, font_size, text
+    x1 is stored so the insertion step can clamp text width to the segment
+    boundary, preventing OCR text from bleeding past the right edge of the
+    page.
     """
     font_path = Path(FONT_PATH)
     if not font_path.exists():
@@ -413,6 +416,7 @@ def create_ocr_text_elements(
 
                     page_elements.append({
                         "x0":         x0,
+                        "x1":         x1,   # segment right edge (pixel space)
                         "y_baseline": y1,
                         "font_size":  max(6, min(sh * 0.9, 72)),
                         "text":       text,
@@ -567,10 +571,30 @@ def process_single_pdf_ocr(input_path: str, output_path: str) -> bool:
                 inserted = 0
                 for elem in elements:
                     try:
+                        x0_pt       = elem["x0"] * sx
+                        x1_pt       = elem["x1"] * sx
+                        baseline_pt = elem["y_baseline"] * sy
+                        fontsize    = max(4, elem["font_size"] * sy)
+
+                        # ── Clamp font size to segment width ─────────────────
+                        # The segment right edge (x1_pt) is the authoritative
+                        # boundary for this line of text.  If the rendered
+                        # string would exceed that boundary, scale the font
+                        # down proportionally so no characters are clipped.
+                        # We also cap at page_w to guard against any segment
+                        # that itself extends marginally past the crop box.
+                        available_w = min(x1_pt, page_w) - x0_pt
+                        if available_w > 0:
+                            text_w = fitz.get_text_length(
+                                elem["text"], fontname=FONT_NAME, fontsize=fontsize
+                            )
+                            if text_w > available_w:
+                                fontsize = max(4, fontsize * available_w / text_w)
+
                         page.insert_text(
-                            fitz.Point(elem["x0"] * sx, elem["y_baseline"] * sy),
+                            fitz.Point(x0_pt, baseline_pt),
                             elem["text"],
-                            fontsize=max(4, elem["font_size"] * sy),
+                            fontsize=fontsize,
                             fontname=FONT_NAME,
                             # No fontfile — helv is a built-in PDF base-14 font.
                             # Omitting fontfile means nothing is embedded, keeping
@@ -694,10 +718,6 @@ def compress_to_target_size(input_pdf: Path, output_pdf: Path, original_size: in
             logger.error(f"Compression option {i+1} failed: {e}")
             temp_out.unlink(missing_ok=True)
 
-    # If still over budget, log a warning and return the uncompressed OCR file.
-    # Aggressive JPEG recompression is intentionally NOT attempted here —
-    # it destroys archival quality and causes generation loss on already-
-    # compressed sources.
     logger.warning(
         "All deflate options exceeded the 15% size budget. "
         "Returning OCR file as-is (images untouched, quality preserved). "
