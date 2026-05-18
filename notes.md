@@ -21,3 +21,9 @@
 
 - A little back and forth while fine tuning the script.
 - Remove 612x792 and 792x612 before processing
+- Also seeing this phenomenon with 630x810 and 810x630
+- uiext25291 and uiext25120 are duplicates on the live site
+
+### crabtree
+
+- Still vetting born-digital objects by dimension since attempts to automate are inaccurate
