@@ -27,3 +27,8 @@
 ### crabtree
 
 - Still vetting born-digital objects by dimension since attempts to automate are inaccurate
+- This was the smoothest processing so far -- no issues with PDF files killing the script
+
+### moscowcoop
+
+- 
