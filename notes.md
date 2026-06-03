@@ -1,13 +1,22 @@
 ## Notes
 
-### Born-Digital dimensions to review after processing
+### Born-Digital dimensions to review before processing
 
-- 960x540
 - 540x960
 - 612x792
-- 792x612
 - 630x810
+- 720x540
+- 756x972 
+- 792x612 
 - 810x630
+- 841x1190 
+- 960x540
+- 960x720
+- 1024x768 
+- 1190x841 
+- 1224x792 
+- 1280x720 
+- 1920x1080 
 
 ### CCC
 
