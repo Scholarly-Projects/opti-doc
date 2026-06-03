@@ -1,5 +1,14 @@
 ## Notes
 
+### Born-Digital dimensions to review after processing
+
+- 960x540
+- 540x960
+- 612x792
+- 792x612
+- 630x810
+- 810x630
+
 ### CCC
 
 - Very strange issue with the tool generating mostly blank documents that you need to troubleshoot. They reproduce some but not all of the images and no OCR. They are all recent docs and they are all 612x792.
@@ -32,3 +41,7 @@
 ### moscowcoop
 
 - 
+
+### blackhistory
+
+- Odd, new phenomenon where the processing seems to be stripping archival scans of text: arg-02-10-1998-uiwsucelebrateblackhistory and others in the review folder. These are not born-digital.
