@@ -49,8 +49,13 @@
 
 ### moscowcoop
 
-- 
+- no interruptions but very slow -- in the later issues these are big, multi-columned documents
 
 ### blackhistory
 
 - Odd, new phenomenon where the processing seems to be stripping archival scans of text: arg-02-10-1998-uiwsucelebrateblackhistory and others in the review folder. These are not born-digital.
+
+### twrs and dworshak
+
+- very quick and only one review item between both collections
+
