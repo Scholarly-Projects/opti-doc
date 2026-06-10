@@ -4,9 +4,9 @@ OCR tool developed by Andrew Weymouth, Digital Initiatives Librarian for Univers
 
 ## Note
 
-Opticolumn and Opticolumns are designed for archival scanned documents, not born-digital PDF files. The tool creates a new OCR layer for scans that are missing OCR or replaces existing OCR when necessary, but it does not create a tagging structure or add other accessibility features.
+Opticolumn and Opticolumns are designed for archival scanned documents, not born-digital PDF files. The tool creates a new OCR layer for scans that are missing OCR or replaces existing OCR when necessary, but it does not create a tagging structure or add other accessibility features. 
 
-If Opticolumn encounters a born-digital PDF, the issue will be obvious. The processing will strip the file of its text and images, leaving a largely blank document. These files can then be easily identified in the B folder and removed while retaining the original PDFs.
+To avoid accidentally overwriting born-digital PDF files that may already have OCR, tagging structure and alt text, Opticolumn will make these files apparent in the processed output, so they can be more easily identified and removed before the original files are replaced. If Opticolumn encounters a born-digital PDF, the processing will strip the file of its text and images, leaving a largely blank document.
 
 Ideally, the tool would automatically detect and skip born-digital files during processing. However, the wide variation in the formatting and metadata of born-digital PDFs has produced too many false positives. As a result, users should review their batches manually. 
 
