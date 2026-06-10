@@ -2,6 +2,7 @@
 
 ### Born-Digital dimensions to review before processing
 
+- 396x612
 - 540x960
 - 612x792
 - 630x810
