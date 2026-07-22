@@ -60,3 +60,7 @@
 
 - very quick and only one review item between both collections
 
+### Psychiana
+
+- All of the Psychiana Weeklies appear to kill the script despite having slightly different dimensions
+
