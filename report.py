@@ -1,5 +1,11 @@
 #!/usr/bin/env python3
 """
+Opticolumn OCR searchability report generator.
+
+For every PDF in A/ (original), finds its identically-named counterpart in
+B/ (OCR-processed), counts "true" searchable words in each using a
+four-stage filter, and writes one CSV row per file pair — plus a trailing
+TOTAL row summarizing the whole batch.
 """
 
 import csv
@@ -20,6 +26,12 @@ REPORT_DIR = "D"        # CSV output destination
 TOOL_NAME    = "Opticolumn"
 TOOL_VERSION = "2026"
 
+# Minimum length for an *unrecognized* capitalized token to still be
+# accepted as a plausible proper noun (Stage 4). Below this, short unknown
+# capitalized fragments — "Th", "St", "Bn" — are far more likely to be OCR
+# noise than real names, so they're now discarded instead of auto-counted.
+MIN_PROPER_NOUN_LEN = 3
+
 # ── Logging ────────────────────────────────────────────────────────────────────
 logging.basicConfig(
     level=logging.INFO,
@@ -29,11 +41,12 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ── CSV fields ─────────────────────────────────────────────────────────────────
+# One row per matched A/B file pair, plus a trailing TOTAL row for the batch.
 CSV_FIELDS = [
     "tool_name",
     "tool_version",
     "report_datetime",
-    "files_processed",
+    "file_name",
     "word_count_A",
     "word_count_B",
     "percent_searchability",
@@ -117,10 +130,10 @@ def is_searchable(raw_token: str) -> bool:
     if token.lower() in _spell:
         return True          # known English word
 
-    if token[0].isupper():
-        return True          # Title-case or ALL-CAPS → potential proper noun
+    if token[0].isupper() and len(token) >= MIN_PROPER_NOUN_LEN:
+        return True          # Title-case or ALL-CAPS, long enough → plausible proper noun
 
-    return False             # unknown all-lowercase → discard
+    return False             # unknown all-lowercase, or too short to trust → discard
 
 
 # ── PDF word count ─────────────────────────────────────────────────────────────
@@ -131,7 +144,10 @@ def count_words(pdf_path: Path) -> int:
     searchability filter, and return the count of valid words.
 
     Works for born-digital PDFs, PDFs with an invisible OCR text layer
-    (render_mode=3 / searchable PDF), and files with no text layer (returns 0).
+    (render_mode=3 / searchable PDF), and files with NO text layer at all —
+    the latter simply return 0 rather than erroring or being skipped, which
+    is what makes an un-OCR'd file in A/ still comparable to its OCR'd
+    counterpart in B/ (see main()).
     """
     try:
         with fitz.open(str(pdf_path)) as doc:
@@ -141,6 +157,18 @@ def count_words(pdf_path: Path) -> int:
         return 0
 
     return sum(1 for tok in full_text.split() if is_searchable(tok))
+
+
+def percent_searchability(words_a: int, words_b: int) -> float:
+    """
+    Percent change in searchable word count from A to B, used identically
+    for both individual file rows and the batch TOTAL row.
+    """
+    if words_a > 0:
+        return ((words_b - words_a) / words_a) * 100
+    # A had no searchable text at all (e.g. image-only, never OCR'd) —
+    # B's entire count is new coverage, not a "percent increase" of zero.
+    return 100.0 if words_b > 0 else 0.0
 
 
 # ── Main ───────────────────────────────────────────────────────────────────────
@@ -163,12 +191,19 @@ def main() -> None:
         logger.error(f"No PDF files found in '{INPUT_DIR}'.")
         sys.exit(1)
 
-    # ── Tally words across all matched pairs ───────────────────────────────────
-    total_words_a   = 0
-    total_words_b   = 0
-    files_processed = 0
+    # ── Compare each matched A/B pair, one CSV row per file ────────────────────
+    now = datetime.datetime.now()
+    report_datetime_str = now.strftime("%Y-%m-%d %H:%M:%S")
+
+    report_rows      = []
+    total_words_a    = 0
+    total_words_b    = 0
+    files_processed  = 0
 
     for a_pdf in a_pdfs:
+        # Matched purely by filename — this is what guarantees a file with
+        # NO existing OCR/text layer in A/ still gets compared against its
+        # OCR'd version in B/, rather than being treated as "no data."
         b_pdf = b_folder / a_pdf.name
 
         if not b_pdf.exists():
@@ -177,10 +212,23 @@ def main() -> None:
             )
             continue
 
-        words_a = count_words(a_pdf)
+        words_a = count_words(a_pdf)   # 0 if A/ has no text layer at all
         words_b = count_words(b_pdf)
+        file_pct = percent_searchability(words_a, words_b)
 
-        logger.info(f"{a_pdf.name}: A={words_a:,} words  B={words_b:,} words")
+        logger.info(
+            f"{a_pdf.name}: A={words_a:,} words  B={words_b:,} words  ({file_pct:+.2f}%)"
+        )
+
+        report_rows.append({
+            "tool_name":             TOOL_NAME,
+            "tool_version":          TOOL_VERSION,
+            "report_datetime":       report_datetime_str,
+            "file_name":             a_pdf.name,
+            "word_count_A":          words_a,
+            "word_count_B":          words_b,
+            "percent_searchability": f"{file_pct:.2f}%",
+        })
 
         total_words_a += words_a
         total_words_b += words_b
@@ -193,31 +241,26 @@ def main() -> None:
         )
         sys.exit(1)
 
-    # ── Percent searchability change ───────────────────────────────────────────
-    if total_words_a > 0:
-        pct = ((total_words_b - total_words_a) / total_words_a) * 100
-    else:
-        # A had no searchable text — B's entire count is new coverage
-        pct = 100.0 if total_words_b > 0 else 0.0
+    # ── Batch TOTAL row ─────────────────────────────────────────────────────────
+    pct = percent_searchability(total_words_a, total_words_b)
 
-    # ── Write CSV ──────────────────────────────────────────────────────────────
-    now      = datetime.datetime.now()
-    csv_path = d_folder / f"opticolumn_report_{now.strftime('%Y%m%d_%H%M%S')}.csv"
-
-    row = {
+    report_rows.append({
         "tool_name":             TOOL_NAME,
         "tool_version":          TOOL_VERSION,
-        "report_datetime":       now.strftime("%Y-%m-%d %H:%M:%S"),
-        "files_processed":       files_processed,
+        "report_datetime":       report_datetime_str,
+        "file_name":             f"TOTAL ({files_processed} files)",
         "word_count_A":          total_words_a,
         "word_count_B":          total_words_b,
         "percent_searchability": f"{pct:.2f}%",
-    }
+    })
+
+    # ── Write CSV ──────────────────────────────────────────────────────────────
+    csv_path = d_folder / f"opticolumn_report_{now.strftime('%Y%m%d_%H%M%S')}.csv"
 
     with open(csv_path, "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=CSV_FIELDS)
         writer.writeheader()
-        writer.writerow(row)
+        writer.writerows(report_rows)
 
     # ── Final summary ──────────────────────────────────────────────────────────
     logger.info(f"\n{'=' * 60}")
