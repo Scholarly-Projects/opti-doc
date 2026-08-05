@@ -64,3 +64,9 @@
 
 - All of the Psychiana Weeklies appear to kill the script despite having slightly different dimensions
 
+### forestryresearch
+
+- forestryresearch877 is an odd outlier that doesn't kill the script but seems to freeze it to stall processes
+
+
+
