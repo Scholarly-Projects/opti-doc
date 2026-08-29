@@ -10,7 +10,7 @@ Example output:
 
 <img width="1920" height="1638" alt="tr_prac_05" src="https://github.com/user-attachments/assets/b6132cad-ea6b-4ea5-bf67-b09dca7c9c67" />
 
-To understand the overall accuracy of the output, the `report.py` uses regular expressions, text mining approaches and spell checking to identify and tally the number of true words between original documents in the A folder and processed files in the B folder. A CSV of the report is generated in the D folder which prints the results for each file and the total increased searchability of the document. According to findings published in Transparent Practices, Opticolumn performed 85% more accurately with handwritten material and 40% more accurately with typed material than OCR produced using Adobe Acrobat.
+To understand the overall accuracy of the output, the `report.py` uses regular expressions, text mining approaches and spell checking to identify and tally the number of true words between original documents in the A folder and processed files in the B folder. A CSV of the report is generated in the D folder which prints the results for each file and the total increased searchability of the document. According to a [randomized 3,200 word survey](https://osf.io/9f483) of processed collection documents from August 2026, Opticolumn improved word-level accuracy by **41.66 percentage points** over the previous Adobe Acrobat OCR layer, a **1.96x improvement**.
 
 ## Note
 
