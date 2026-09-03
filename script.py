@@ -7,7 +7,7 @@ import sys
 import os
 import tempfile
 from pathlib import Path
-import fitz  # PyMuPDF
+import fitz  
 from kraken import blla
 from kraken.lib.vgsl import TorchVGSLModel
 from io import BytesIO
@@ -36,14 +36,12 @@ TROCR_MODELS = {
     "large_printed":     "microsoft/trocr-large-printed",
 }
 TROCR_MODEL_NAME               = TROCR_MODELS["large_handwritten"]
-ENABLE_PREPROCESSING           = True   # affects OCR copy only, not stored images
+ENABLE_PREPROCESSING           = True   
 CONFIDENCE_THRESHOLD           = 0.25
 SINGLE_CHAR_CONFIDENCE_THRESHOLD = 0.5
 MIN_SEGMENT_HEIGHT             = 10
-# For invisible OCR text (render_mode=3) we use a PDF base-14 font so that
-# nothing is embedded in the output file — eliminating ~400 KB per document.
-FONT_NAME  = "helv"                  # Helvetica — built-in, zero embedding overhead
-FONT_PATH  = "fonts/FreeSans.ttf"   # retained for future visible-text needs only
+FONT_NAME  = "helv"                  
+FONT_PATH  = "fonts/FreeSans.ttf"   
 SRGB_ICC_PATH = "srgb.icc"
 DEBUG_OCR_LAYER         = False
 DEBUG_TEXT_POSITIONS    = False
@@ -596,10 +594,7 @@ def process_single_pdf_ocr(input_path: str, output_path: str) -> bool:
                             elem["text"],
                             fontsize=fontsize,
                             fontname=FONT_NAME,
-                            # No fontfile — helv is a built-in PDF base-14 font.
-                            # Omitting fontfile means nothing is embedded, keeping
-                            # file size growth to the OCR text stream only.
-                            render_mode=3,       # invisible text (PDF §9.3.6)
+                            render_mode=3,      
                             color=(0, 0, 0),
                         )
                         inserted += 1
